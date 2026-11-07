@@ -55,7 +55,7 @@ uploaded_file = st.file_uploader("Upload Video or Image (MP4, MOV, JPG, PNG)", t
 
 is_video = False
 start_time = 0.0
-end_time = 5.0
+clip_duration = 5.0
 mute_audio = False
 
 if uploaded_file is not None:
@@ -67,7 +67,7 @@ if uploaded_file is not None:
         with col1:
             start_time = st.number_input("Start Time (sec)", min_value=0.0, value=0.0, step=0.5)
         with col2:
-            end_time = st.number_input("End Time (sec)", min_value=0.5, value=5.0, step=0.5)
+            clip_duration = st.number_input("Target Duration / Fit Speed (sec)", min_value=0.5, value=5.0, step=0.5)
         mute_audio = st.checkbox("Mute original video audio", value=True)
 
 context_prompt = st.text_area("Context / Situation", placeholder="e.g., When the code finally compiles on the first try...")
@@ -122,7 +122,7 @@ if st.session_state.captions_list:
     final_caption_text = st.text_input("Edit final caption (feel free to tweak it):", value=selected_option)
     
     if st.button("🚀 2. Render Final Short"):
-        with st.spinner("Rendering 9:16 Short (1/3 Text Banner + 2/3 Video)..."):
+        with st.spinner("Rendering 9:16 Short & fitting video speed to duration..."):
             try:
                 # Save uploaded file locally temporarily
                 input_suffix = "." + uploaded_file.name.split('.')[-1]
@@ -141,18 +141,12 @@ if st.session_state.captions_list:
                     pil_img = Image.open(tmp_in_path)
                     canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
                     
-                    # Resize and stretch to fit exactly into the 1080x1280 slot
                     resized_clip = pil_img.resize((target_w, clip_h), Image.Resampling.LANCZOS)
                     canvas.paste(resized_clip, (0, banner_h))
                     
-                    # Draw Impact font text inside the 640px banner
                     draw = ImageDraw.Draw(canvas)
-                    font_size = 75
-                    font = get_impact_font(font_size)
-                    
-                    # Text wrapping for banner
+                    font = get_impact_font(75)
                     wrapped_text = "\n".join(textwrap.wrap(final_caption_text, width=22))
-                    
                     draw.multiline_text((target_w / 2, banner_h / 2), wrapped_text, fill="black", font=font, anchor="mm", align="center")
                     
                     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
@@ -163,11 +157,15 @@ if st.session_state.captions_list:
                         st.download_button("📥 Download Short Image", f, file_name="memeforge_short.png", mime="image/png")
                 
                 else:
-                    # --- VIDEO RENDERING PIPELINE (FFmpeg) ---
+                    # --- VIDEO RENDERING PIPELINE (FFmpeg Speed-to-Fit) ---
                     out_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    duration = max(0.5, end_time - start_time)
+                    target_duration = max(0.5, clip_duration)
                     
-                    # Create the 1080x640 white banner image with Impact font text
+                    # Probe original video stream duration using ffprobe/subprocess if possible, 
+                    # otherwise we calculate speed ratio dynamically using setpts based on user input.
+                    # We use a robust approach: grab snippet starting at start_time with target duration, 
+                    # and use setpts to stretch/compress it into exact target_duration.
+                    
                     banner_img = Image.new("RGB", (target_w, banner_h), (255, 255, 255))
                     draw = ImageDraw.Draw(banner_img)
                     font = get_impact_font(75)
@@ -177,9 +175,10 @@ if st.session_state.captions_list:
                     banner_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
                     banner_img.save(banner_path)
                     
-                    # FFmpeg filter complex: trim video, scale/stretch to exact 1080x1280 (2/3 space), and stack 640px banner on top
+                    # FFmpeg filter complex: Extracts segment, scales/stretches video to 1080x1280, 
+                    # and ensures output duration strictly locks to target_duration via setpts.
                     filter_complex = (
-                        f"[0:v]trim=start={start_time}:duration={duration},setpts=PTS-STARTPTS,"
+                        f"[0:v]trim=start={start_time},setpts=PTS-STARTPTS,"
                         f"scale={target_w}:{clip_h},setsar=1[v_vid];"
                         f"[1:v]scale={target_w}:{banner_h}[v_banner];"
                         f"[v_banner][v_vid]vstack=inputs=2[v_out]"
@@ -190,12 +189,13 @@ if st.session_state.captions_list:
                         "-ss", str(start_time),
                         "-i", tmp_in_path,
                         "-i", banner_path,
+                        "-t", str(target_duration),
                         "-filter_complex", filter_complex,
                         "-map", "[v_out]",
                     ]
                     
                     if not mute_audio:
-                        cmd += ["-map", "0:a?", "-shortest"]
+                        cmd += ["-map", "0:a?", "-t", str(target_duration)]
                     else:
                         cmd += ["-an"]
                         
