@@ -35,7 +35,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🔥 MemeForge v3")
-st.caption("Browser Edition — Full Video & 7-Caption Suite")
+st.caption("Browser Edition — Full Video, 7-Caption Suite & Punchline Generator")
 
 # Sidebar Configuration
 with st.sidebar:
@@ -46,9 +46,11 @@ with st.sidebar:
         ["Gen-Z Meme Lord", "Sarcastic & Savage", "Relatable / Everyday", "Absurdist / Shitpost"]
     )
 
-# Session State Initialization for Captions workflow
+# Session State Initialization
 if "captions_list" not in st.session_state:
     st.session_state.captions_list = []
+if "punchlines_list" not in st.session_state:
+    st.session_state.punchlines_list = []
 
 # Main Input Section
 uploaded_file = st.file_uploader("Upload Video or Image (MP4, MOV, JPG, PNG)", type=["mp4", "mov", "avi", "jpg", "jpeg", "png", "webp"])
@@ -74,7 +76,6 @@ if uploaded_file is not None:
         raw_segment_duration = max(0.1, end_time - start_time)
         st.caption(f"✂️ Raw Segment Length: {raw_segment_duration:.1f}s")
         
-        # User-editable target duration for speed-to-fit stretching
         target_duration = st.number_input(
             "Target Duration (sec) — Clip will speed up/slow down to fit this length", 
             min_value=0.5, 
@@ -131,24 +132,34 @@ def get_impact_font(size):
 if st.session_state.captions_list:
     st.markdown("### 🎯 Choose or Edit Your Caption")
     selected_option = st.selectbox("Quick-select from generated options:", st.session_state.captions_list)
-    
-    # Editable text box pre-filled with the selected choice
     final_caption_text = st.text_input("Edit final caption (feel free to tweak it):", value=selected_option)
     
-    if st.button("🚀 2. Render Final Short"):
-        with st.spinner("Rendering 9:16 Short & stretching video speed to fit target duration..."):
+    if st.button("🚀 2. Render Final Short & Generate Punchlines"):
+        with st.spinner("Rendering 9:16 Short and generating viral punchlines via Gemini 3.5..."):
             try:
-                # Save uploaded file locally temporarily
+                # 1. Generate 7 Punchlines using Gemini 3.5 Flash based on context and final caption
+                client = genai.Client(api_key=api_key_input)
+                punchline_prompt = f"""
+                Context / Situation: {context_prompt}
+                Chosen Meme Caption: {final_caption_text}
+                
+                Generate exactly 7 distinct, highly engaging punchlines or description hook lines for this short-form video (suitable for TikTok/Shorts descriptions or comment prompts).
+                Return ONLY the 7 lines separated by newlines, with no extra numbering, quotes, or markdown.
+                """
+                punch_response = client.models.generate_content(
+                    model='gemini-3.5-flash',
+                    contents=[punchline_prompt]
+                )
+                p_lines = [line.strip() for line in punch_response.text.strip().split('\n') if line.strip()]
+                st.session_state.punchlines_list = p_lines[:7]
+
+                # 2. Render Media File
                 input_suffix = "." + uploaded_file.name.split('.')[-1]
                 with tempfile.NamedTemporaryFile(delete=False, suffix=input_suffix) as tmp_in:
                     tmp_in.write(uploaded_file.getvalue())
                     tmp_in_path = tmp_in.name
                 
-                # Canvas Layout Specs: 1080x1920 total. Top 1/3 (640px) banner, Bottom 2/3 (1280px) clip.
-                target_w = 1080
-                target_h = 1920
-                banner_h = 640
-                clip_h = 1280
+                target_w, target_h, banner_h, clip_h = 1080, 1920, 640, 1280
 
                 if not is_video:
                     # --- IMAGE RENDERING PIPELINE ---
@@ -166,16 +177,16 @@ if st.session_state.captions_list:
                     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
                     canvas.save(out_path, "PNG")
                     
+                    st.success("Image Short rendered successfully!")
                     st.image(out_path, caption="Ready Short (Image)", use_container_width=True)
                     with open(out_path, "rb") as f:
                         st.download_button("📥 Download Short Image", f, file_name="memeforge_short.png", mime="image/png")
                 
                 else:
-                    # --- VIDEO RENDERING PIPELINE (FFmpeg Speed Warp / Stretch-to-Fit) ---
+                    # --- VIDEO RENDERING PIPELINE (FFmpeg Speed Warp) ---
                     out_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    
                     raw_dur = max(0.1, end_time - start_time)
-                    speed_factor = raw_dur / target_duration  # e.g. raw 5s / target 2.5s = 2.0x speed up
+                    speed_factor = raw_dur / target_duration
                     
                     banner_img = Image.new("RGB", (target_w, banner_h), (255, 255, 255))
                     draw = ImageDraw.Draw(banner_img)
@@ -186,56 +197,32 @@ if st.session_state.captions_list:
                     banner_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
                     banner_img.save(banner_path)
                     
-                    # FFmpeg filter complex:
-                    # 1. Trims source from start_time with raw duration
-                    # 2. Applies setpts to time-warp (speed up/slow down) video so it fits target_duration exactly
-                    # 3. Scales/stretches video to 1080x1280
-                    # 4. Stacks the 640px banner on top
-                    filter_complex = (
-                        f"[0:v]trim=start={start_time}:duration={raw_dur},setpts=(PTS-STARTPTS)*({target_duration}/{raw_dur}),"
-                        f"scale={target_w}:{clip_h},setsar=1[v_vid];"
-                        f"[1:v]scale={target_w}:{banner_h}[v_banner];"
-                        f"[v_banner][v_vid]vstack=inputs=2[v_out]"
-                    )
-                    
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-ss", str(start_time),
-                        "-i", tmp_in_path,
-                        "-i", banner_path,
-                        "-filter_complex", filter_complex,
-                        "-map", "[v_out]",
-                    ]
-                    
                     if not mute_audio:
-                        # Atempo audio filter handles audio speed matching
-                        atempo_val = max(0.5, min(2.0, speed_factor)) # ffmpeg atempo supports 0.5 to 2.0 per filter
-                        cmd += [
-                            "-filter_complex_script", # or inline audio filter
-                            # simpler: use atempo filter on audio stream
-                        ]
-                        # Let's cleanly apply audio filter via filter_complex or fallback to -an if complex
-                        # To keep it robust with vstack, we can map audio with atempo:
                         filter_complex_full = (
                             f"[0:v]trim=start={start_time}:duration={raw_dur},setpts=(PTS-STARTPTS)*({target_duration}/{raw_dur}),"
                             f"scale={target_w}:{clip_h},setsar=1[v_vid];"
                             f"[1:v]scale={target_w}:{banner_h}[v_banner];"
                             f"[v_banner][v_vid]vstack=inputs=2[v_out];"
-                            f"[0:a]atrim=start={start_time}:duration={raw_dur},asetpts=PTS-STARTPTS,atempo={speed_factor}[a_out]"
+                            f"[0:a]atrim=start={start_time}:duration={raw_dur},asetpts=PTS-STARTPTS,atempo={max(0.5, min(2.0, speed_factor))}[a_out]"
                         )
                         cmd = [
-                            "ffmpeg", "-y",
-                            "-ss", str(start_time),
-                            "-i", tmp_in_path,
-                            "-i", banner_path,
-                            "-filter_complex", filter_complex_full,
-                            "-map", "[v_out]", "-map", "[a_out]"
+                            "ffmpeg", "-y", "-ss", str(start_time), "-i", tmp_in_path, "-i", banner_path,
+                            "-filter_complex", filter_complex_full, "-map", "[v_out]", "-map", "[a_out]",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", out_video_path
                         ]
                     else:
-                        cmd += ["-an"]
+                        filter_complex = (
+                            f"[0:v]trim=start={start_time}:duration={raw_dur},setpts=(PTS-STARTPTS)*({target_duration}/{raw_dur}),"
+                            f"scale={target_w}:{clip_h},setsar=1[v_vid];"
+                            f"[1:v]scale={target_w}:{banner_h}[v_banner];"
+                            f"[v_banner][v_vid]vstack=inputs=2[v_out]"
+                        )
+                        cmd = [
+                            "ffmpeg", "-y", "-ss", str(start_time), "-i", tmp_in_path, "-i", banner_path,
+                            "-filter_complex", filter_complex, "-map", "[v_out]", "-an",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", out_video_path
+                        ]
                         
-                    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", out_video_path]
-                    
                     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
                     
                     st.success("Video Short rendered successfully!")
@@ -246,3 +233,16 @@ if st.session_state.captions_list:
                         
             except Exception as e:
                 st.error(f"Render Error (Ensure FFmpeg is installed on your system path): {e}")
+
+# Step 3: Display 7 Copyable Punchlines if available
+if st.session_state.punchlines_list:
+    st.markdown("---")
+    st.markdown("### 🔥 7 Viral Punchlines / Description Hooks")
+    st.caption("Copy these individually for your Short/Reel descriptions or comments (not burned into the video):")
+    
+    for idx, punchline in enumerate(st.session_state.punchlines_list, 1):
+        cols = st.columns([0.85, 0.15])
+        with cols[0]:
+            st.text_input(f"Punchline {idx}", value=punchline, key=f"punch_{idx}", label_visibility="collapsed")
+        with cols[1]:
+            st.code(f"{punchline}", language=None)
