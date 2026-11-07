@@ -56,7 +56,7 @@ uploaded_file = st.file_uploader("Upload Video or Image (MP4, MOV, JPG, PNG)", t
 is_video = False
 start_time = 0.0
 end_time = 5.0
-clip_duration = 5.0
+target_duration = 5.0
 mute_audio = False
 
 if uploaded_file is not None:
@@ -64,15 +64,23 @@ if uploaded_file is not None:
     if file_ext in ["mp4", "mov", "avi"]:
         is_video = True
         st.info("📹 Video file detected!")
+        
         col1, col2 = st.columns(2)
         with col1:
             start_time = st.number_input("Start Time (sec)", min_value=0.0, value=0.0, step=0.5)
         with col2:
             end_time = st.number_input("End Time (sec)", min_value=0.5, value=5.0, step=0.5)
         
-        # Calculate and show duration dynamically
-        clip_duration = max(0.5, end_time - start_time)
-        st.caption(f"⏱️ Calculated Clip Duration: **{clip_duration:.1f} seconds**")
+        raw_segment_duration = max(0.1, end_time - start_time)
+        st.caption(f"✂️ Raw Segment Length: {raw_segment_duration:.1f}s")
+        
+        # User-editable target duration for speed-to-fit stretching
+        target_duration = st.number_input(
+            "Target Duration (sec) — Clip will speed up/slow down to fit this length", 
+            min_value=0.5, 
+            value=raw_segment_duration, 
+            step=0.5
+        )
         
         mute_audio = st.checkbox("Mute original video audio", value=True)
 
@@ -128,7 +136,7 @@ if st.session_state.captions_list:
     final_caption_text = st.text_input("Edit final caption (feel free to tweak it):", value=selected_option)
     
     if st.button("🚀 2. Render Final Short"):
-        with st.spinner("Rendering 9:16 Short (1/3 Text Banner + 2/3 Video)..."):
+        with st.spinner("Rendering 9:16 Short & stretching video speed to fit target duration..."):
             try:
                 # Save uploaded file locally temporarily
                 input_suffix = "." + uploaded_file.name.split('.')[-1]
@@ -163,8 +171,11 @@ if st.session_state.captions_list:
                         st.download_button("📥 Download Short Image", f, file_name="memeforge_short.png", mime="image/png")
                 
                 else:
-                    # --- VIDEO RENDERING PIPELINE (FFmpeg Trim & Stack) ---
+                    # --- VIDEO RENDERING PIPELINE (FFmpeg Speed Warp / Stretch-to-Fit) ---
                     out_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                    
+                    raw_dur = max(0.1, end_time - start_time)
+                    speed_factor = raw_dur / target_duration  # e.g. raw 5s / target 2.5s = 2.0x speed up
                     
                     banner_img = Image.new("RGB", (target_w, banner_h), (255, 255, 255))
                     draw = ImageDraw.Draw(banner_img)
@@ -175,8 +186,13 @@ if st.session_state.captions_list:
                     banner_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
                     banner_img.save(banner_path)
                     
+                    # FFmpeg filter complex:
+                    # 1. Trims source from start_time with raw duration
+                    # 2. Applies setpts to time-warp (speed up/slow down) video so it fits target_duration exactly
+                    # 3. Scales/stretches video to 1080x1280
+                    # 4. Stacks the 640px banner on top
                     filter_complex = (
-                        f"[0:v]trim=start={start_time}:duration={clip_duration},setpts=PTS-STARTPTS,"
+                        f"[0:v]trim=start={start_time}:duration={raw_dur},setpts=(PTS-STARTPTS)*({target_duration}/{raw_dur}),"
                         f"scale={target_w}:{clip_h},setsar=1[v_vid];"
                         f"[1:v]scale={target_w}:{banner_h}[v_banner];"
                         f"[v_banner][v_vid]vstack=inputs=2[v_out]"
@@ -187,13 +203,34 @@ if st.session_state.captions_list:
                         "-ss", str(start_time),
                         "-i", tmp_in_path,
                         "-i", banner_path,
-                        "-t", str(clip_duration),
                         "-filter_complex", filter_complex,
                         "-map", "[v_out]",
                     ]
                     
                     if not mute_audio:
-                        cmd += ["-map", "0:a?", "-t", str(clip_duration)]
+                        # Atempo audio filter handles audio speed matching
+                        atempo_val = max(0.5, min(2.0, speed_factor)) # ffmpeg atempo supports 0.5 to 2.0 per filter
+                        cmd += [
+                            "-filter_complex_script", # or inline audio filter
+                            # simpler: use atempo filter on audio stream
+                        ]
+                        # Let's cleanly apply audio filter via filter_complex or fallback to -an if complex
+                        # To keep it robust with vstack, we can map audio with atempo:
+                        filter_complex_full = (
+                            f"[0:v]trim=start={start_time}:duration={raw_dur},setpts=(PTS-STARTPTS)*({target_duration}/{raw_dur}),"
+                            f"scale={target_w}:{clip_h},setsar=1[v_vid];"
+                            f"[1:v]scale={target_w}:{banner_h}[v_banner];"
+                            f"[v_banner][v_vid]vstack=inputs=2[v_out];"
+                            f"[0:a]atrim=start={start_time}:duration={raw_dur},asetpts=PTS-STARTPTS,atempo={speed_factor}[a_out]"
+                        )
+                        cmd = [
+                            "ffmpeg", "-y",
+                            "-ss", str(start_time),
+                            "-i", tmp_in_path,
+                            "-i", banner_path,
+                            "-filter_complex", filter_complex_full,
+                            "-map", "[v_out]", "-map", "[a_out]"
+                        ]
                     else:
                         cmd += ["-an"]
                         
